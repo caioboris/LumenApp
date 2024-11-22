@@ -1,6 +1,8 @@
 package br.com.fiap.mobile.lumenapp
 
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.border
@@ -27,14 +29,19 @@ import androidx.compose.ui.tooling.preview.PreviewParameter
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.navigation.NavController
+import androidx.navigation.NavType
 import androidx.navigation.compose.*
+import androidx.navigation.navArgument
 import br.com.fiap.mobile.lumenapp.models.Painel
 import br.com.fiap.mobile.lumenapp.ui.theme.LoginAppTheme
 import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
+import kotlinx.coroutines.delay
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.MediaType
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -44,6 +51,7 @@ import java.io.IOException
 
 class MainActivity : ComponentActivity() {
     val client = OkHttpClient()
+    val gson = Gson();
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -53,8 +61,15 @@ class MainActivity : ComponentActivity() {
                 NavHost(navController, startDestination = "login") {
                     composable("login") { LoginScreen(navController) }
                     composable("home") { HomeScreen(navController) }
-                    composable("cadastro_painel") { CadastroPainelScreen() }
+                    composable("cadastro_painel") { CadastroPainelScreen(navController) }
                     composable("listagem_paineis") { ListagemPaineisScreen(navController) }
+                    composable(
+                        route = "editar/{id}",
+                        arguments = listOf(navArgument("id") { type = NavType.IntType })
+                    ) { backStackEntry ->
+                        val painelId = backStackEntry.arguments?.getInt("id") ?: return@composable
+                        EditarPainelScreen(painelId, navController)
+                    }
                 }
             }
         }
@@ -77,7 +92,6 @@ class MainActivity : ComponentActivity() {
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // Campo de Nome de Usuário
             BasicTextField(
                 value = username,
                 onValueChange = { username = it },
@@ -113,13 +127,11 @@ class MainActivity : ComponentActivity() {
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // Exibindo mensagem de erro
             if (errorMessage.isNotEmpty()) {
                 Text(text = errorMessage, color = Color.Red)
                 Spacer(modifier = Modifier.height(8.dp))
             }
 
-            // Botão de Login
             Button(
                 onClick = {
                     if (username.text == "admin" && password.text == "1234") {
@@ -179,18 +191,33 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    fun CadastroPainelScreen() {
+    fun CadastroPainelScreen(navController: NavController) {
         var nome by remember { mutableStateOf("") }
         var producaoMedia by remember { mutableStateOf("") }
         var isSuccess by remember { mutableStateOf(false) }
         var errorMessage by remember { mutableStateOf("") }
 
+        // Função para realizar o cadastro
         fun handleCadastro() {
             if (nome.isNotEmpty() && producaoMedia.isNotEmpty()) {
                 val painel = Painel(id = 0, nome = nome, producaoMedia = producaoMedia.toDouble())
                 val urlCadastro = "https://ecosynergy-api.azurewebsites.net/api/Painel"
 
-                cadastrarPainel(painel, urlCadastro)
+                cadastrarPainel(
+                    painel = painel,
+                    url = urlCadastro,
+                    onSuccess = {
+                        isSuccess = true
+                        runOnUiThread {
+                            Handler(Looper.getMainLooper()).postDelayed({
+                                navController.popBackStack()
+                            }, 2000)
+                        }
+                    },
+                    onError = { message ->
+                        errorMessage = message
+                    }
+                )
             } else {
                 errorMessage = "Todos os campos devem ser preenchidos!"
             }
@@ -243,14 +270,23 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+
     @Composable
     fun ListagemPaineisScreen(navController: NavController) {
         var paineis by remember { mutableStateOf<List<Painel>>(emptyList()) }
         var errorMessage by remember { mutableStateOf("") }
 
-        fun carregarPaineis(){
+        fun carregarPaineis() {
             val urlListagem = "https://ecosynergy-api.azurewebsites.net/api/Painel"
-            listarPaineis(urlListagem)
+            listarPaineis(urlListagem, onSuccess = { painels ->
+                paineis = painels // Atualizando o estado com os dados recebidos
+            }, onError = { message ->
+                errorMessage = message // Atualizando o estado com a mensagem de erro
+            })
+        }
+
+        LaunchedEffect(true) {
+            carregarPaineis()
         }
 
         Column(
@@ -268,6 +304,11 @@ class MainActivity : ComponentActivity() {
             LazyColumn(
                 modifier = Modifier.fillMaxSize()
             ) {
+                if (paineis.isEmpty()) {
+                    item {
+                        Text("Nenhum painel encontrado.", style = MaterialTheme.typography.bodyMedium)
+                    }
+                }else{
                 items(paineis) { painel ->
                     Card(
                         modifier = Modifier
@@ -304,24 +345,118 @@ class MainActivity : ComponentActivity() {
                                     Icon(Icons.Default.Delete, contentDescription = "Excluir", tint = Color.Red)
                                 }
                             }
-
+                            }
                         }
                     }
                 }
             }
 
-            // Mensagem de erro
             if (errorMessage.isNotEmpty()) {
                 Text("Erro: $errorMessage", color = Color.Red, modifier = Modifier.padding(top = 16.dp))
             }
         }
     }
 
-    fun cadastrarPainel(painel: Painel, url: String) {
-        val jsonBody = Gson().toJson(painel)
+    @Composable
+    fun EditarPainelScreen(painelId: Int, navController: NavController) {
+        var nome by remember { mutableStateOf("") }
+        var producaoMedia by remember { mutableStateOf("") }
+        var errorMessage by remember { mutableStateOf("") }
+        var isLoading by remember { mutableStateOf(true) }
 
-        val body = jsonBody
-            .toRequestBody("application/json".toMediaType())
+        // Carregar os detalhes do painel a partir da API
+        fun carregarPainelDetalhes() {
+            isLoading = true
+            carregarPainelDetalhes(painelId, onSuccess = { painel ->
+                nome = painel.nome
+                producaoMedia = painel.producaoMedia.toString()
+                isLoading = false
+            }, onError = { message ->
+                errorMessage = message
+                isLoading = false
+            })
+        }
+
+        // Carregar os detalhes assim que a tela for composta
+        LaunchedEffect(painelId) {
+            carregarPainelDetalhes() // Chama a função para carregar os dados do painel
+        }
+
+        fun salvarPainel() {
+            val novaProducaoMedia = producaoMedia.toDoubleOrNull()
+
+            if (novaProducaoMedia != null) {
+                atualizarPainel(painelId, nome, novaProducaoMedia,
+                    onSuccess = {
+                        // Se a atualização for bem-sucedida, retorna à tela de listagem
+                        navController.popBackStack()
+                    },
+                    onError = { message ->
+                        errorMessage = message
+                    }
+                )
+            } else {
+                errorMessage = "Produção média inválida"
+            }
+        }
+
+        // Exibição da tela
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Top
+        ) {
+            Text("Editar Painel", style = MaterialTheme.typography.headlineMedium)
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // Exibindo mensagem de erro caso tenha ocorrido
+            if (errorMessage.isNotEmpty()) {
+                Text("Erro: $errorMessage", color = Color.Red, modifier = Modifier.padding(top = 16.dp))
+            }
+
+            // Se estiver carregando, exibe um indicador de carregamento
+            if (isLoading) {
+                CircularProgressIndicator(modifier = Modifier.align(Alignment.CenterHorizontally))
+            } else {
+                // Campos de edição (apenas se os dados forem carregados)
+                TextField(
+                    value = nome,
+                    onValueChange = { nome = it },
+                    label = { Text("Nome") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                TextField(
+                    value = producaoMedia,
+                    onValueChange = { producaoMedia = it },
+                    label = { Text("Produção Média (kWh)") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                Button(
+                    onClick = {
+                        salvarPainel()
+                        navController.popBackStack()
+                    },
+                    modifier = Modifier.align(Alignment.End)
+                ) {
+                    Text("Salvar")
+                }
+            }
+        }
+    }
+
+    fun cadastrarPainel(painel: Painel, url: String, onSuccess: () -> Unit, onError: (String) -> Unit) {
+        val jsonBody = Gson().toJson(painel)
+        val body = jsonBody.toRequestBody("application/json".toMediaType())
+
         val request = Request.Builder()
             .url(url)
             .post(body)
@@ -329,45 +464,49 @@ class MainActivity : ComponentActivity() {
 
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
-                e.printStackTrace()
+                onError("Erro ao realizar o cadastro: ${e.message}")
             }
 
             override fun onResponse(call: Call, response: Response) {
                 if (response.isSuccessful) {
                     val responseBody = response.body?.string()
                     println("Cadastro realizado com sucesso: $responseBody")
+                    runOnUiThread {
+                        onSuccess()
+                    }
                 } else {
-                    println("Erro no cadastro: ${response.code}")
+                    onError("Erro no cadastro: ${response.code}")
                 }
             }
         })
     }
 
-    fun listarPaineis(url: String) {
+    fun listarPaineis(url: String, onSuccess: (List<Painel>) -> Unit, onError: (String) -> Unit) {
+
         val request = Request.Builder()
             .url(url)
-            .get()
             .build()
 
-        // Envia a requisição de forma assíncrona
-        client.newCall(request).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) {
-                e.printStackTrace() // Tratar erro aqui
+        client.newCall(request).enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
+                // Chamando o onError caso haja falha na requisição
+                onError("Falha na requisição: ${e.message}")
             }
 
-            override fun onResponse(call: Call, response: Response) {
+            override fun onResponse(call: okhttp3.Call, response: Response) {
                 if (response.isSuccessful) {
-                    // Sucesso, processa a resposta aqui
-                    val responseBody = response.body?.string()
-
-                    // Converte a resposta JSON em uma lista de objetos Painel
-                    val paineis = Gson().fromJson(responseBody, Array<Painel>::class.java).toList()
-                    paineis.forEach {
-                        println("Painel: ${it.id}, ${it.nome}, ${it.producaoMedia}")
+                    // Caso a requisição seja bem-sucedida, parse a resposta JSON
+                    val responseBody = response.body?.string() ?: ""
+                    try {
+                        // Usando Gson para deserializar a lista de Painéis
+                        val painelListType = object : TypeToken<List<Painel>>() {}.type
+                        val paineis: List<Painel> = gson.fromJson(responseBody, painelListType)
+                        onSuccess(paineis)
+                    } catch (e: Exception) {
+                        onError("Erro ao processar os dados: ${e.message}")
                     }
                 } else {
-                    // Tratar erro HTTP
-                    println("Erro na listagem: ${response.code}")
+                    onError("Erro na requisição: ${response.message}")
                 }
             }
         })
@@ -393,5 +532,68 @@ class MainActivity : ComponentActivity() {
         })
     }
 
+    fun carregarPainelDetalhes(id: Int, onSuccess: (Painel) -> Unit, onError: (String) -> Unit) {
+        val client = OkHttpClient()
+        val url = "https://ecosynergy-api.azurewebsites.net/api/Painel/$id" // URL da API com o ID como parâmetro
+
+        val request = Request.Builder()
+            .url(url)
+            .build()
+
+        client.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: java.io.IOException) {
+                onError("Falha na requisição: ${e.message}")
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                if (response.isSuccessful) {
+                    val responseBody = response.body?.string()
+                    if (responseBody != null) {
+                        try {
+                            val painel = Gson().fromJson(responseBody, Painel::class.java)
+                            onSuccess(painel) // Retorna o painel com os dados da API
+                        } catch (e: Exception) {
+                            onError("Erro ao processar os dados: ${e.message}")
+                        }
+                    } else {
+                        onError("Resposta vazia da API")
+                    }
+                } else {
+                    onError("Erro na requisição: ${response.message}")
+                }
+            }
+        })
+    }
+
+    fun atualizarPainel(id: Int, nome: String, producaoMedia: Double, onSuccess: () -> Unit, onError: (String) -> Unit) {
+        val client = OkHttpClient()
+
+        val url = "https://ecosynergy-api.azurewebsites.net/api/Painel/$id" // A URL com o id na rota
+
+        val painelAtualizado = Painel(id, nome, producaoMedia)
+
+        val json = Gson().toJson(painelAtualizado)
+
+        val requestBody = json.toRequestBody("application/json".toMediaType())
+
+        val request = Request.Builder()
+            .url(url)
+            .put(requestBody)
+            .build()
+
+        client.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                onError("Erro na requisição: ${e.message}")
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                if (response.isSuccessful) {
+                    onSuccess()
+                } else {
+                    onError("Erro ao atualizar painel: ${response.message}")
+                }
+            }
+        })
+    }
 }
 
